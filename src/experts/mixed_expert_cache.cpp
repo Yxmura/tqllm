@@ -378,7 +378,11 @@ std::vector<int> MixedExpertCache::prepare(int layer, const std::vector<int> & i
     std::vector<std::pair<int, int>> batch_commit;
     auto flush_batch = [&] {
         if (batch_dst.empty()) return;
+#if !defined(TQLLM_WITH_HIP)
         cudaMemcpyAttributes attr = {}; attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream; attr.flags = cudaMemcpyFlagPreferOverlapWithCompute;
+#else
+        int attr = 0; (void)attr;
+#endif
         size_t first = 0;
 #if CUDART_VERSION >= 13000
         checked(cudaMemcpyBatchAsync(batch_dst.data(), batch_src.data(), batch_bytes.data(), batch_dst.size(), &attr, &first, 1, up));
@@ -757,6 +761,32 @@ int MixedExpertCache::regrow(size_t keep_free) {
         s.layer_cap[size_t(l)] = s.layer_target[size_t(l)];
         if (s.planned.size() != size_t(s.layers)) s.planned.assign(size_t(s.layers), 0);
         s.planned[size_t(l)] = 1;  // built at the target, not sized again by choose_cap
+        if (!held.empty()) { (void) prepare(l, held); wait_misses(); }
+    }
+    return n;
+}
+int MixedExpertCache::shrink_to_free(size_t need, int floor_slots) {
+    auto & s = *state_;
+    if (s.layer_cap.empty()) s.layer_cap.assign(size_t(s.layers), s.capacity);
+    std::vector<int> caps(size_t(s.layers)), floor(size_t(s.layers), std::max(1, floor_slots)); std::vector<size_t> sb(size_t(s.layers));
+    for (int l = 0; l < s.layers; ++l) {
+        const auto it = s.banks.find(l);
+        caps[size_t(l)] = it != s.banks.end() ? it->second->cap : s.cap_of(l); sb[size_t(l)] = it != s.banks.end() ? s.slot_bytes(l) : 0;
+    }
+    const auto next = tqllm::shrink_caps(caps, floor, sb, need);
+    int n = 0;
+    for (int l = 0; l < s.layers; ++l) {
+        if (next[size_t(l)] >= caps[size_t(l)]) continue;
+        const auto it = s.banks.find(l);
+        std::vector<int> held; for (int id : it->second->ids) if (id >= 0) held.push_back(id);
+        const uint64_t * fq = s.frequency.data() + size_t(l) * s.experts;  // the most-used experts stay
+        std::stable_sort(held.begin(), held.end(), [&](int a, int b) { return fq[a] > fq[b]; });
+        if (int(held.size()) > next[size_t(l)]) held.resize(size_t(next[size_t(l)]));
+        release_bank(l); ++n;
+        s.layer_cap[size_t(l)] = next[size_t(l)];
+        if (!s.layer_target.empty()) s.layer_target[size_t(l)] = std::min(s.layer_target[size_t(l)], next[size_t(l)]);
+        if (s.planned.size() != size_t(s.layers)) s.planned.assign(size_t(s.layers), 0);
+        s.planned[size_t(l)] = 1;  // built at this size, not sized again by choose_cap
         if (!held.empty()) { (void) prepare(l, held); wait_misses(); }
     }
     return n;

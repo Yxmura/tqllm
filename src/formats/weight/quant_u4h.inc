@@ -151,6 +151,18 @@ __device__ __forceinline__ uint32_t iq4nl_codes(uint32_t c) {
     const uint32_t sel = c & 0x7777u;
     return __byte_perm(__byte_perm(L0, L1, sel), __byte_perm(L2, L3, sel), 0x3210u | ((c >> 1) & 0x4444u));
 }
+// NVFP4 (FMT 16, NVF4): E2M1 nibble -> code byte 128 + 2 e2m1 (0, +-1, 2, 3, 4, 6, 8, 12); value = (code - 128) * s / 2 with s the
+// group's E4M3 scale x the row's global scale (rounded to FP16 as the kernel's (scale, min) pair). Nibble order as IQ4L.
+__device__ __forceinline__ float nvf4_e4m3(uint8_t b) {  // OCP E4M3 (NVFP4 group scales are finite and >= 0)
+    const int e = (b >> 3) & 15, m = b & 7;
+    const float v = e ? __int_as_float(((e + 120) << 23) | (m << 20)) : float(m) * 0.001953125f;  // 2^(e-7)(1 + m/8); m 2^-9
+    return (b & 0x80) ? -v : v;
+}
+__device__ __forceinline__ uint32_t nvf4_codes(uint32_t c) {
+    constexpr uint32_t L0 = 0x83828180u, L1 = 0x8C888684u, L2 = 0x7D7E7F80u, L3 = 0x74787A7Cu;
+    const uint32_t sel = c & 0x7777u;
+    return __byte_perm(__byte_perm(L0, L1, sel), __byte_perm(L2, L3, sel), 0x3210u | ((c >> 1) & 0x4444u));
+}
 // One lane's 32-weight block s of rows ra and rb in the u4h-family layout: load() reads its codes and (scale, min) pairs,
 // codes(h) returns the code bytes of 16-group h (value = code * scale + min). Shared by u4h_matvec_k and u4h_gemm_k.
 // TQFN_TILED expert banks: the code bytes of 16-row x 4-block tiles are stored lane-contiguous (row-in-tile major, then
@@ -176,7 +188,20 @@ struct U4hTile {
     __device__ __forceinline__ void load(const uint8_t * w4, const __half2 * sm, int k, int ra, int rb, int s, int nb, bool ok) {
         if (ok) {
             const bool tl = GROUPED && tiled_bpb(FMT) && c_tiled_experts;
-            if constexpr (FMT == 13 || FMT == 14) {  // IQ4N / IQ4L: 16 B natural nibbles per 32 weights
+            if constexpr (FMT == 16) {  // NVF4: 16 B natural nibbles per 32 weights; aux row = k / 16 E4M3 scales, then the F32 global
+                wa = __ldg(reinterpret_cast<const uint4 *>(w4 + (int64_t(ra) * nb + s) * 16));
+                wb = __ldg(reinterpret_cast<const uint4 *>(w4 + (int64_t(rb) * nb + s) * 16));
+                const auto * ab = reinterpret_cast<const uint8_t *>(sm);
+                const int64_t rs = k / 16 + 4;
+                const uint8_t * pa = ab + int64_t(ra) * rs, * pb = ab + int64_t(rb) * rs;
+                const float ga = 0.5f * __ldg(reinterpret_cast<const float *>(pa + k / 16)), gb = 0.5f * __ldg(reinterpret_cast<const float *>(pb + k / 16));
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const float fa = nvf4_e4m3(__ldg(pa + 2 * s + h)) * ga, fb = nvf4_e4m3(__ldg(pb + 2 * s + h)) * gb;
+                    pk(__floats2half2_rn(fa, -128.f * fa), sa[h], ma[h]);
+                    pk(__floats2half2_rn(fb, -128.f * fb), sb[h], mb[h]);
+                }
+            } else if constexpr (FMT == 13 || FMT == 14) {  // IQ4N / IQ4L: 16 B natural nibbles per 32 weights
                 wa = __ldg(reinterpret_cast<const uint4 *>(w4 + u4h_block_off(ra, s, nb, 16, tl)));
                 wb = __ldg(reinterpret_cast<const uint4 *>(w4 + u4h_block_off(rb, s, nb, 16, tl)));
                 float fa, fb;
@@ -298,9 +323,10 @@ struct U4hTile {
     // One code word (k 4u..4u+3 of 16-group h) of rows a and b: the int8 kernel's lane t needs only u = t, so the grid
     // formats do one lookup instead of four. Formats without a specialisation take the full decode.
     __device__ __forceinline__ void codes1(int h, int u, int s, bool ok, const uint32_t * grid, uint32_t & ca, uint32_t & cb) {
-        if constexpr (FMT == 13 || FMT == 14) {
+        if constexpr (FMT == 13 || FMT == 14 || FMT == 16) {
             const uint32_t a2 = h ? (u < 2 ? wa.z : wa.w) : (u < 2 ? wa.x : wa.y), b2 = h ? (u < 2 ? wb.z : wb.w) : (u < 2 ? wb.x : wb.y);
-            ca = iq4nl_codes((a2 >> (16 * (u & 1))) & 0xFFFFu); cb = iq4nl_codes((b2 >> (16 * (u & 1))) & 0xFFFFu);
+            if constexpr (FMT == 16) { ca = nvf4_codes((a2 >> (16 * (u & 1))) & 0xFFFFu); cb = nvf4_codes((b2 >> (16 * (u & 1))) & 0xFFFFu); }
+            else { ca = iq4nl_codes((a2 >> (16 * (u & 1))) & 0xFFFFu); cb = iq4nl_codes((b2 >> (16 * (u & 1))) & 0xFFFFu); }
         } else if constexpr (FMT == 5) {
             const uint32_t qa = h ? wa.y : wa.x, qb = h ? wb.y : wb.x; const int w = 4 * h + u;
             ca = iq3x_code(grid[(qa >> (8 * u)) & 0xFF], iq3x_signs(wa.z, w)); cb = iq3x_code(grid[(qb >> (8 * u)) & 0xFF], iq3x_signs(wb.z, w));
@@ -309,12 +335,17 @@ struct U4hTile {
         }
     }
     __device__ __forceinline__ void codes(int h, int s, bool ok, const uint32_t * grid, uint32_t wa4[4], uint32_t wb4[4]) {
-        if constexpr (FMT == 13 || FMT == 14) {  // weights 16h + 4u .. + 3: nibbles of 16-bit half (u & 1) of word 2h + u / 2
+        if constexpr (FMT == 13 || FMT == 14 || FMT == 16) {  // weights 16h + 4u .. + 3: nibbles of 16-bit half (u & 1) of word 2h + u / 2
             const uint32_t a2[2] = {h ? wa.z : wa.x, h ? wa.w : wa.y}, b2[2] = {h ? wb.z : wb.x, h ? wb.w : wb.y};
 #pragma unroll
             for (int u = 0; u < 4; ++u) {
-                wa4[u] = iq4nl_codes((a2[u / 2] >> (16 * (u & 1))) & 0xFFFFu);
-                wb4[u] = iq4nl_codes((b2[u / 2] >> (16 * (u & 1))) & 0xFFFFu);
+                if constexpr (FMT == 16) {
+                    wa4[u] = nvf4_codes((a2[u / 2] >> (16 * (u & 1))) & 0xFFFFu);
+                    wb4[u] = nvf4_codes((b2[u / 2] >> (16 * (u & 1))) & 0xFFFFu);
+                } else {
+                    wa4[u] = iq4nl_codes((a2[u / 2] >> (16 * (u & 1))) & 0xFFFFu);
+                    wb4[u] = iq4nl_codes((b2[u / 2] >> (16 * (u & 1))) & 0xFFFFu);
+                }
             }
             return;
         } else if constexpr (FMT == 15) {  // int8 -> code + 128
@@ -781,9 +812,13 @@ __global__ void quant_act_rows_k(const __half * x, const int * rows_of, const in
     }
 }
 __device__ __forceinline__ void mma_s8_k16(int (&d)[4], uint32_t a0, uint32_t a1, uint32_t b0) {
+#if defined(TQLLM_WITH_HIP)
+    (void)d; (void)a0; (void)a1; (void)b0;  // sparse IMMA is CUDA-only; dense path uses mma_s8_k32
+#else
     constexpr int M = 0x4B400000;
     asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};\n"
                  : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a0), "r"(a1), "r"(b0), "r"(M), "r"(M), "r"(M), "r"(M));
+#endif
 }
 __device__ __forceinline__ float h2lo(uint32_t v) { return __half2float(__ushort_as_half(uint16_t(v & 0xFFFFu))); }
 // 64 rows x 64 columns per CTA, 8 warps: warp w takes row tile w & 3 and k half w >> 2 (blocks 4 (w >> 2) .. + 3 of each
@@ -792,10 +827,14 @@ __device__ __forceinline__ float h2lo(uint32_t v) { return __half2float(__ushort
 // with a scale per 16 use two k16 MMAs. Where min = -OFF * scale exactly (power-of-two OFF, exact in half) the int8
 // operand is code - OFF and no min term is needed; the other formats use code - 128 and add (128 scale + min) * sum(q).
 __device__ __forceinline__ void mma_s8_k32(int (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+#if defined(TQLLM_WITH_HIP)
+    tqllm_dev::mma_s8(d, a0, a1, a2, a3, b0, b1);  // same fragment contract; native v_dot4
+#else
     constexpr int M = 0x4B400000;
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
                  : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(M), "r"(M), "r"(M), "r"(M));
+#endif
 }
 template <int FMT> __host__ __device__ constexpr int i8_offset() {  // min == -offset * scale: 0 = generic (min term)
     // IQ4_NL / IQ4_XS: code - 128 is exact (verified against the fp16 kernel and an fp64 oracle). Every other format takes the
@@ -982,12 +1021,24 @@ __global__ void __launch_bounds__(256) u4h_i8_gemm_k(const uint8_t * w4, const _
 // groups (32 rows = 2 m16) x 2 token groups (64 tokens = 8 n8): 16 tensor-core ops per warp per 32 k. Per-32-scale formats
 // use one m16n8k32 per block, per-16 formats two m16n8k16. Same exact int -> float trick as u4h_i8_gemm_k.
 __device__ __forceinline__ void cp_async16(void * smem, const void * gmem, bool pred) {
+#if defined(TQLLM_WITH_HIP)
+    if (pred) *reinterpret_cast<uint4 *>(smem) = __ldg(reinterpret_cast<const uint4 *>(gmem));
+#else
     const unsigned sa = static_cast<unsigned>(__cvta_generic_to_shared(smem));
     const int n = pred ? 16 : 0;
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(sa), "l"(gmem), "r"(n));
+#endif
 }
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-__device__ __forceinline__ void cp_async_wait0() { asm volatile("cp.async.wait_group 0;\n" ::); }
+__device__ __forceinline__ void cp_async_commit() {
+#if !defined(TQLLM_WITH_HIP)
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+__device__ __forceinline__ void cp_async_wait0() {
+#if !defined(TQLLM_WITH_HIP)
+    asm volatile("cp.async.wait_group 0;\n" ::);
+#endif
+}
 template <int FMT, bool TOKEN>
 __global__ void __launch_bounds__(256) u4h_i8v3_gemm_k(const uint8_t * w4, const __half2 * sm, const int8_t * xq, const float * xs,
                                                        const int16_t * xsum, __nv_bfloat16 * y, int rows, int k,

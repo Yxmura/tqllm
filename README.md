@@ -9,16 +9,39 @@
 
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-davidytan2000-BD5FFF?logo=buymeacoffee&logoColor=white)](https://www.buymeacoffee.com/davidytan2000) [![GoFundMe](https://img.shields.io/badge/GoFundMe-support%20TQLLM-00B964?logo=gofundme&logoColor=white)](https://gofund.me/0f79d4274)
 
-C++ inference for supported Qwen models and TurboQuant GGUF weights on NVIDIA GPUs (CUDA) and Apple Silicon (Metal),
-with an OpenAI-compatible HTTP server.
+C++ inference for supported Qwen models and TurboQuant GGUF weights on NVIDIA GPUs (CUDA), AMD GPUs
+(ROCm/HIP) and Apple Silicon (Metal), with an OpenAI-compatible HTTP server.
 
 [Quick start](docs/guides/quickstart.md) | [Documentation](docs/README.md) | [Benchmarks](docs/BENCHMARKS.md) | [Credits](docs/CREDITS.md)
 
-**New: Qwen3.8-Flash-Next (125B MoE, 6B active) on one RTX 3090.** Against Strata 0.2.2 on the same card, file and
-session: decode 1.63x after a 128K prompt (77.1 against 47.2 tok/s), 1.34x after 64K, first token sooner at every
-length, and up to 8 users at once with the same text as one. [Details](docs/BENCHMARKS.md#qwen38-flash-next-125b-6b-active-on-one-rtx-3090).
-Run it with image 1.4.2 or newer (RTX 30 or newer with 24 GB, or a GB10): [setup](https://huggingface.co/YTan2000/Qwen3.8-Flash-Next-tqLLM) (the public IQ3_S
-GGUF plus a few small files; 24 GB GPU, 64 GB RAM or more).
+**New in [1.4.4](https://github.com/turbo-tan/tqllm/releases/tag/v1.4.4)** (same machine, same session for every comparison):
+
+- **DGX Spark, Qwen3.8-27B:** prompts up to 1.42x faster than TensorFold 1.2.3 in its own record setup (8 slots x 131,072),
+  faster at every length from 2K to 128K, also on TensorFold's own EXL3 file.
+- **RTX 3090, Qwen3.8-Flash-Next (125B MoE, 6B active):** with 2 to 12 users at once, up to 34 % more total output than
+  Strata 0.2.12; no more out-of-memory on long answers on 24 GB cards.
+- **Mac, Qwen3.8-27B 4-bit (48 GB M5 Pro):** answers 8-44 % faster than Splash 1.5.0 from 16K to 128K, and a 256K context
+  where TensorFold does not fit. Install with `brew install turbo-tan/tap/tqllm`.
+- **New files:** Unsloth Dynamic v3.1 Flash-Next GGUFs, NVIDIA's NVFP4 Flash-Next experts, Qwen3.8-27B EXL3 folders.
+
+Flash-Next setup (RTX 30 or newer with 24 GB and 64 GB RAM, or a GB10):
+[YTan2000/Qwen3.8-Flash-Next-tqLLM](https://huggingface.co/YTan2000/Qwen3.8-Flash-Next-tqLLM).
+[Benchmarks](docs/BENCHMARKS.md).
+
+## Supported models
+
+Checked on the release build: the model loads and answers a fixed question correctly (1.4.4: RTX 3090, M5 Pro Mac).
+
+| Model | Files tqLLM loads | Hardware | 1.4.4 check |
+|---|---|---|---|
+| Qwen3.8-27B and fine-tunes (e.g. Qwopus3.8) | TQ3_4S, TQ_L / TQ4, K-quant and IQ GGUFs; EXL3 folders; DFlash2 and MTP drafters | NVIDIA, 16 GB and up; DGX Spark / GB10 | passed |
+| Qwen3.8-27B on a Mac | mlx-community 4-bit, TQ_L, QSA files ([Mac guide](docs/guides/mac.md)) | Apple Silicon (48 GB tested) | passed |
+| Qwen3.8-Flash-Next (125B MoE, 6B active) | `.tqfn` manifest over the public IQ3_S GGUF, tqLLM's own file, Unsloth Dynamic v3.1 GGUFs, NVIDIA NVFP4 experts | 24 GB GPU + 64 GB RAM; DGX Spark / GB10 | passed |
+| Qwen3.5 / Qwen3.6 27B | same formats as Qwen3.8-27B (same architecture) | NVIDIA | not re-run for 1.4.4 |
+| GLM-5.3-Flash, MiniMax-M3.1-Flash | GSQ GGUF; EXL3 folder ([guide](docs/guides/gb10-big-moe.md)) | one GB10, one request | not re-run for 1.4.4 |
+
+Not supported yet: Qwen3.5 sizes with tied embeddings (4B and smaller: the file has no `output.weight`), and
+Qwen3.5 / 3.6 mixture-of-experts GGUFs (`qwen35moe`, such as Qwen3.6-35B-A3B) are not verified on 1.4.4.
 
 ## See what your model is doing
 
@@ -40,7 +63,16 @@ Recorded with a real model. The local hostname is hidden; telemetry is unmodifie
 
 ## Run locally
 
-On a Mac (Apple Silicon), follow the [Mac guide](docs/guides/mac.md). The steps below are for Linux with an NVIDIA GPU. Place a supported Qwen GGUF at
+On a Mac (Apple Silicon, macOS 15 or newer):
+
+```sh
+curl -fsSL https://tqllm.com/install.sh | bash   # or: brew install turbo-tan/tap/tqllm
+tqllm serve                          # first run downloads the model and drafter
+tqllm claude                         # Claude Code pointed at the local server (or: tqllm codex)
+```
+
+More in the [Mac guide](docs/guides/mac.md); on an AMD GPU, the [AMD guide](docs/guides/amd.md) has the
+CMake flags (`-DTQLLM_CUDA=OFF -DTQLLM_HIP=ON`). The steps below are for Linux with an NVIDIA GPU. Place a supported Qwen GGUF at
 `models/model.gguf`, then build from source:
 
 ```sh
@@ -52,9 +84,14 @@ cmake --build build --target tqserve -j4
 Open **[localhost:8086](http://localhost:8086/)** for the monitor. Applications use
 the same server at `http://localhost:8086/v1`.
 
-Prefer Docker? With the model in place, run `docker compose up --build`.
-The walkthrough uses the source build; released images may predate these monitor
-updates. See [installation and requirements](docs/guides/quickstart.md).
+Prefer Docker? The prebuilt image (x86-64 and arm64) runs the same server:
+
+```sh
+docker run --rm --gpus all -p 127.0.0.1:8086:8086 -v "$PWD/models:/models:ro" --entrypoint tqserve \
+  ghcr.io/turbo-tan/tqllm:1.4.4 --model /models/model.gguf --host 0.0.0.0 --port 8086
+```
+
+or build it locally with `docker compose up --build`. See [installation and requirements](docs/guides/quickstart.md).
 
 ## Choose your next step
 

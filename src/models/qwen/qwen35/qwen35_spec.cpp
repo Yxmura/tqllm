@@ -1,4 +1,5 @@
 // qwen35 engine: speculative decoding (DFlash, MTP, verify, slots). The class is declared in qwen35_engine.hpp.
+#include "qwen35_rules.hpp"
 #include "qwen35_engine.hpp"
 
 namespace tqllm {
@@ -146,8 +147,9 @@ void Qwen35Engine::dflash_inject_body(const bf16 * feats, int n) {  // positions
 void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t count, int D) {
     const auto P = uint32_t(prompt.size());
     const int H = int(cfg.hidden), nf = int(dfl.target_ids.size());
-    // sampled or image requests decode without MTP (exact either way), so no request fails for asking for them
-    const bool use_mtp = opt.native_mtp && mtp.present && !sampling() && mm_pending.empty();
+    // image requests decode without MTP (exact either way), so no request fails for asking for them. Sampled requests
+    // keep MTP: its drafts are deterministic (argmax), so accept() / accept_drafts give exact samples of the target's p.
+    const bool use_mtp = opt.native_mtp && mtp.present && mm_pending.empty();
     const bool dfl_on = dfl.present;
     if (use_mtp) {
         if (!mtp.present) throw std::runtime_error("--mtp needs a model with an MTP head");
@@ -246,6 +248,12 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
                     if (final) {
                         sync_ck();
                         next = h_tok[0];
+                        if (sampling()) {  // sample the first token now: the first MTP draft below must follow it, and
+                                           // the draft's head pass may overwrite column 0's top-16 on the device
+                            ck(cudaMemcpy(h_sid.data(), s_id.p, 16 * 4, cudaMemcpyDeviceToHost));
+                            ck(cudaMemcpy(h_slg.data(), s_lg.p, 16 * 4, cudaMemcpyDeviceToHost));
+                            next = draw(dist(0), rng);
+                        }
                     }
                     const int pairs = int(std::min<uint32_t>(uint32_t(m), P - t - 1));
                     for (int off = 0; off < pairs; off += NVER) {
@@ -285,7 +293,7 @@ void Qwen35Engine::dflash_begin(const std::vector<uint32_t> & prompt, uint32_t c
             }
         }
         if (!use_mtp) next = h_tok[0];
-        if (sampling()) {  // the final chunk's head wrote column 0's top-16
+        if (sampling() && !use_mtp) {  // the final chunk's head wrote column 0's top-16 (MTP: sampled in the loop)
             ck(cudaMemcpy(h_sid.data(), s_id.p, 16 * 4, cudaMemcpyDeviceToHost));
             ck(cudaMemcpy(h_slg.data(), s_lg.p, 16 * 4, cudaMemcpyDeviceToHost));
             next = draw(dist(0), rng);
@@ -341,16 +349,14 @@ void Qwen35Engine::dflash_step(const int * slots, int ns, bool * done) {
     segs.clear();
     batch_topk = false;
     int col = 0;
-    // Column budget: past ~8-12 columns the verify matmuls turn tensor-core bound, so with many slots each drafts
-    // fewer tokens (the greedy output does not depend on the draft length).
-    // Blackwell (GB10 LPDDR5X, 5060 Ti) stays memory-bound up to the full NB columns; GA10x GeForce FP32-accumulate
-    // tensor rate caps useful width near 16 (3090, c=4 mixed code / essays: budget 16 -> 283 / 198, 24 -> 281 / 173,
-    // 32 -> 249 / 138 tok/s; four identical prime prompts favour 24: 300 / 341 / 314).
+    // Column budget per device class (qwen35_rules.hpp): past it the verify matmuls cost per column, so with many slots
+    // each drafts fewer tokens.
     static const int budget = [this] {
-        int dev = 0, major = 0;
+        int dev = 0, major = 0, integrated = 0;
         cudaGetDevice(&dev);
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-        return major >= 10 ? NB : 16;
+        cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev);
+        return tqllm::qwen35::verify_column_budget(major, integrated != 0, NB);
     }();
     int live = 0;
     for (int i = 0; i < ns; ++i) {
@@ -807,8 +813,9 @@ bool Qwen35Engine::mtp_advance() {
     in.insert(in.end(), draft.begin(), draft.end());
     verify(in.data(), int(in.size()), gen.pos, res.data());
     const auto t2 = std::chrono::steady_clock::now();
-    int j = 0;
-    while (j < D && draft[size_t(j)] == res[size_t(j)]) ++j;
+    // greedy: longest prefix matching the target's argmax; sampling: speculative sampling with the deterministic MTP
+    // draft (accept draft j with the target's probability of it, else resample without it), res[j] the next token
+    const int j = accept(draft, res.data(), 0);
     ++gen.steps;
     gen.drafted += uint64_t(D);
     gen.accepted += uint64_t(j);
